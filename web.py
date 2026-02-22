@@ -4,36 +4,81 @@ import discord
 from discord import app_commands
 from flask import Flask
 import threading
+import requests
+import base64
 
-# ================= TOKEN =================
+# ================= ENV =================
 
-TOKEN = os.getenv("BOTTOKEN")
-if not TOKEN:
-    raise ValueError("No token found. Set BOTTOKEN in Render environment variables.")
+DISCORD_TOKEN = os.getenv("BOTTOKEN")
+GITHUB_TOKEN = os.getenv("PATTOKEN")
 
-# ================= FLASK (Render Keep-Alive) =================
+if not DISCORD_TOKEN:
+    raise ValueError("Missing BOTTOKEN")
 
-app = Flask(__name__)
+if not GITHUB_TOKEN:
+    print("Warning: No PATTOKEN provided. GitHub sync disabled.")
 
-@app.route("/")
-def home():
-    return "Bot is running!"
+# ======== EDIT THESE TWO LINES ONLY ========
+GITHUB_USER = "YOUR_USERNAME"
+GITHUB_REPO = "YOUR_REPO"
+# ===========================================
 
-def run_web():
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+DB_FILE = "stats.db"
+GITHUB_PATH = "stats.db"
 
-# ================= DISCORD SETUP =================
+# ================= GITHUB SYNC =================
 
-intents = discord.Intents.default()
-intents.members = True  # Needed for member lookup
+def gh_headers():
+    return {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json"
+    }
 
-bot = discord.Client(intents=intents)
-tree = app_commands.CommandTree(bot)
+def download_db():
+    if not GITHUB_TOKEN:
+        return
+
+    url = f"https://api.github.com/repos/{GITHUB_USER}/{GITHUB_REPO}/contents/{GITHUB_PATH}"
+    r = requests.get(url, headers=gh_headers())
+
+    if r.status_code == 200:
+        content = base64.b64decode(r.json()["content"])
+        with open(DB_FILE, "wb") as f:
+            f.write(content)
+        print("Downloaded stats.db from GitHub")
+    else:
+        print("No remote DB found. Starting fresh.")
+
+def upload_db():
+    if not GITHUB_TOKEN:
+        return
+
+    url = f"https://api.github.com/repos/{GITHUB_USER}/{GITHUB_REPO}/contents/{GITHUB_PATH}"
+
+    with open(DB_FILE, "rb") as f:
+        content = base64.b64encode(f.read()).decode()
+
+    # Check if file exists to get SHA
+    r = requests.get(url, headers=gh_headers())
+    sha = r.json()["sha"] if r.status_code == 200 else None
+
+    data = {
+        "message": "Update stats.db",
+        "content": content
+    }
+
+    if sha:
+        data["sha"] = sha
+
+    requests.put(url, headers=gh_headers(), json=data)
+    print("Uploaded stats.db to GitHub")
+
+# Download latest DB at startup
+download_db()
 
 # ================= DATABASE =================
 
-conn = sqlite3.connect("stats.db", check_same_thread=False)
+conn = sqlite3.connect(DB_FILE, check_same_thread=False)
 cursor = conn.cursor()
 
 cursor.execute("""
@@ -48,7 +93,31 @@ CREATE TABLE IF NOT EXISTS players (
 """)
 conn.commit()
 
-# ================= REGISTER =================
+def save_db():
+    conn.commit()
+    upload_db()
+
+# ================= DISCORD =================
+
+intents = discord.Intents.default()
+intents.members = True
+
+bot = discord.Client(intents=intents)
+tree = app_commands.CommandTree(bot)
+
+# ================= FLASK (Render Keep Alive) =================
+
+app = Flask(__name__)
+
+@app.route("/")
+def home():
+    return "Bot running"
+
+def run_web():
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
+
+# ================= COMMANDS =================
 
 @tree.command(name="register", description="Register your Smash Karts ID")
 @app_commands.describe(sk_id="Your Smash Karts IGN")
@@ -58,7 +127,7 @@ async def register(interaction: discord.Interaction, sk_id: str):
 
     cursor.execute("SELECT * FROM players WHERE user_id = ?", (user_id,))
     if cursor.fetchone():
-        await interaction.response.send_message("You are already registered!", ephemeral=True)
+        await interaction.response.send_message("Already registered", ephemeral=True)
         return
 
     try:
@@ -66,25 +135,14 @@ async def register(interaction: discord.Interaction, sk_id: str):
             "INSERT INTO players (user_id, sk_id) VALUES (?, ?)",
             (user_id, sk_id)
         )
-        conn.commit()
+        save_db()
     except sqlite3.IntegrityError:
-        await interaction.response.send_message("This SK ID is already registered!", ephemeral=True)
+        await interaction.response.send_message("IGN already taken", ephemeral=True)
         return
 
-    await interaction.response.send_message(
-        f"✅ Registered with SK ID: **{sk_id}**",
-        ephemeral=True
-    )
+    await interaction.response.send_message("Registered!", ephemeral=True)
 
-# ================= EDIT STATS =================
-
-@tree.command(name="editstats", description="Edit your own stats")
-@app_commands.describe(
-    kills="Total kills",
-    deaths="Total deaths",
-    matches="Total matches",
-    wins="Total wins"
-)
+@tree.command(name="editstats", description="Edit your stats")
 async def editstats(interaction: discord.Interaction, kills: int, deaths: int, matches: int, wins: int):
 
     user_id = interaction.user.id
@@ -96,18 +154,14 @@ async def editstats(interaction: discord.Interaction, kills: int, deaths: int, m
 
     cursor.execute("""
         UPDATE players
-        SET kills = ?, deaths = ?, matches = ?, wins = ?
-        WHERE user_id = ?
+        SET kills=?, deaths=?, matches=?, wins=?
+        WHERE user_id=?
     """, (kills, deaths, matches, wins, user_id))
 
-    conn.commit()
+    save_db()
+    await interaction.response.send_message("Stats updated!", ephemeral=True)
 
-    await interaction.response.send_message("✅ Stats updated!", ephemeral=True)
-
-# ================= PROFILE =================
-
-@tree.command(name="profile", description="View player's stats")
-@app_commands.describe(member="Select a member")
+@tree.command(name="profile", description="View player stats")
 async def profile(interaction: discord.Interaction, member: discord.Member):
 
     cursor.execute("SELECT * FROM players WHERE user_id = ?", (member.id,))
@@ -120,10 +174,7 @@ async def profile(interaction: discord.Interaction, member: discord.Member):
     _, sk_id, kills, deaths, matches, wins = data
     kdr = round(kills / deaths, 2) if deaths > 0 else kills
 
-    embed = discord.Embed(
-        title=f"{member.name}'s Stats",
-        color=discord.Color.blue()
-    )
+    embed = discord.Embed(title=f"{member.name}'s Stats", color=discord.Color.blue())
     embed.add_field(name="SK ID", value=sk_id, inline=False)
     embed.add_field(name="Kills", value=kills)
     embed.add_field(name="Deaths", value=deaths)
@@ -133,50 +184,17 @@ async def profile(interaction: discord.Interaction, member: discord.Member):
 
     await interaction.response.send_message(embed=embed)
 
-# ================= LEADERBOARD =================
+@tree.command(name="leaderboard", description="Top players by kills")
+async def leaderboard(interaction: discord.Interaction):
 
-@tree.command(name="leaderboard", description="View leaderboard")
-@app_commands.describe(category="Choose leaderboard type")
-@app_commands.choices(category=[
-    app_commands.Choice(name="Kills", value="kills"),
-    app_commands.Choice(name="KDR", value="kdr"),
-    app_commands.Choice(name="Wins", value="wins")
-])
-async def leaderboard(interaction: discord.Interaction, category: app_commands.Choice[str]):
+    cursor.execute("SELECT sk_id, kills FROM players ORDER BY kills DESC LIMIT 10")
+    data = cursor.fetchall()
 
-    description = ""
+    desc = ""
+    for i, (sk_id, kills) in enumerate(data, 1):
+        desc += f"**{i}. {sk_id}** - {kills} kills\n"
 
-    if category.value == "kills":
-        cursor.execute("SELECT sk_id, kills FROM players ORDER BY kills DESC LIMIT 10")
-        data = cursor.fetchall()
-        title = "🩸 Kill Leaderboard"
-        for i, (sk_id, kills) in enumerate(data, 1):
-            description += f"**{i}. {sk_id}** - {kills} kills\n"
-
-    elif category.value == "wins":
-        cursor.execute("SELECT sk_id, wins FROM players ORDER BY wins DESC LIMIT 10")
-        data = cursor.fetchall()
-        title = "🏆 Wins Leaderboard"
-        for i, (sk_id, wins) in enumerate(data, 1):
-            description += f"**{i}. {sk_id}** - {wins} wins\n"
-
-    elif category.value == "kdr":
-        cursor.execute("SELECT sk_id, kills, deaths FROM players")
-        players = cursor.fetchall()
-
-        kdr_list = []
-        for sk_id, kills, deaths in players:
-            kdr = kills / deaths if deaths > 0 else kills
-            kdr_list.append((sk_id, round(kdr, 2)))
-
-        kdr_list.sort(key=lambda x: x[1], reverse=True)
-        top = kdr_list[:10]
-
-        title = "🎯 KDR Leaderboard"
-        for i, (sk_id, kdr) in enumerate(top, 1):
-            description += f"**{i}. {sk_id}** - {kdr} KDR\n"
-
-    embed = discord.Embed(title=title, description=description, color=discord.Color.gold())
+    embed = discord.Embed(title="Kill Leaderboard", description=desc, color=discord.Color.gold())
     await interaction.response.send_message(embed=embed)
 
 # ================= READY =================
@@ -189,9 +207,8 @@ async def on_ready():
 # ================= START =================
 
 def run_bot():
-    bot.run(TOKEN)
+    bot.run(DISCORD_TOKEN)
 
 if __name__ == "__main__":
-    # Run Flask and Discord together
     threading.Thread(target=run_web).start()
     run_bot()
