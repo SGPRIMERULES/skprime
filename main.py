@@ -274,7 +274,6 @@ async def on_message(message):
         if any(user_id in [u.id for u in message.mentions] for user_id in infected[guild_id]):
             infected[guild_id].add(message.author.id)
             await message.channel.send(f"🧟 {message.author.mention} is infected!")
-    )
 
 # ---------------- COURT ---------------- #
 
