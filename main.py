@@ -4,7 +4,6 @@ keep_alive()
 import discord
 from discord.ext import commands
 from discord import app_commands
-import sqlite3
 import random
 import asyncio
 import os
@@ -13,7 +12,7 @@ import aiohttp
 import html
 from flask import Flask
 from threading import Thread
-
+import io
 # ---------------- BOT SETUP ---------------- #
 
 intents = discord.Intents.default()
@@ -23,55 +22,83 @@ intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 TOKEN = os.environ.get("TOKEN")
 
-# ---------------- DATABASE ---------------- #
+# ================== ASYNC XP SYSTEM (RENDER SAFE) ================== #
 
-conn = sqlite3.connect("database.db")
-cursor = conn.cursor()
-
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS users (
-    user_id INTEGER PRIMARY KEY,
-    xp INTEGER DEFAULT 0,
-    level INTEGER DEFAULT 1
-)
-""")
-conn.commit()
-
-# ================== XP SYSTEM ================== #
-
+import aiosqlite
 import random
 import asyncio
 from PIL import Image, ImageDraw, ImageFont
 import aiohttp
 import io
 
+DB_PATH = "database.db"
 xp_cooldown = {}
+
+
+# ---------------- DATABASE SETUP ---------------- #
+
+async def setup_database():
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            xp INTEGER DEFAULT 0,
+            level INTEGER DEFAULT 1
+        )
+        """)
+        await db.commit()
+
+
+# ---------------- XP LOGIC ---------------- #
 
 def xp_required(level):
     return int(100 * (level ** 1.5))
 
-def add_xp(user_id, amount):
-    cursor.execute("SELECT xp, level FROM users WHERE user_id=?", (user_id,))
-    data = cursor.fetchone()
 
-    if not data:
-        xp, level = 0, 1
-        cursor.execute("INSERT INTO users VALUES (?, ?, ?)", (user_id, xp, level))
-    else:
-        xp, level = data
+async def add_xp(user_id, amount):
+    async with aiosqlite.connect(DB_PATH) as db:
 
-    xp += amount
-    leveled_up = False
+        async with db.execute(
+            "SELECT xp, level FROM users WHERE user_id=?",
+            (user_id,)
+        ) as cursor:
+            data = await cursor.fetchone()
 
-    while xp >= xp_required(level):
-        xp -= xp_required(level)
-        level += 1
-        leveled_up = True
+        if not data:
+            xp = 0
+            level = 1
+            await db.execute(
+                "INSERT INTO users (user_id, xp, level) VALUES (?, ?, ?)",
+                (user_id, xp, level)
+            )
+        else:
+            xp, level = data
 
-    cursor.execute("UPDATE users SET xp=?, level=? WHERE user_id=?", (xp, level, user_id))
-    conn.commit()
+        xp += amount
+        leveled_up = False
+
+        while xp >= xp_required(level):
+            xp -= xp_required(level)
+            level += 1
+            leveled_up = True
+
+        await db.execute(
+            "UPDATE users SET xp=?, level=? WHERE user_id=?",
+            (xp, level, user_id)
+        )
+
+        await db.commit()
 
     return leveled_up, level, xp
+
+
+async def get_user_data(user_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT xp, level FROM users WHERE user_id=?",
+            (user_id,)
+        ) as cursor:
+            return await cursor.fetchone()
 
 
 # ================== RANK CARD IMAGE ================== #
@@ -81,7 +108,6 @@ async def create_rank_card(member, xp, level):
     bg = Image.new("RGB", (width, height), (15, 15, 25))
     draw = ImageDraw.Draw(bg)
 
-    # Fetch avatar
     async with aiohttp.ClientSession() as session:
         async with session.get(member.display_avatar.url) as resp:
             avatar_bytes = await resp.read()
@@ -122,10 +148,11 @@ async def create_leaderboard(guild):
     draw = ImageDraw.Draw(bg)
     font = ImageFont.load_default()
 
-    cursor.execute(
-        "SELECT user_id, level, xp FROM users ORDER BY level DESC, xp DESC LIMIT 10"
-    )
-    top_users = cursor.fetchall()
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT user_id, level, xp FROM users ORDER BY level DESC, xp DESC LIMIT 10"
+        ) as cursor:
+            top_users = await cursor.fetchall()
 
     draw.text((350, 20), "SERVER LEADERBOARD", fill=(255, 255, 255), font=font)
 
@@ -164,7 +191,7 @@ async def on_message(message):
     if message.author.id not in xp_cooldown or now - xp_cooldown[message.author.id] > 30:
         xp_cooldown[message.author.id] = now
 
-        leveled_up, level, xp = add_xp(
+        leveled_up, level, xp = await add_xp(
             message.author.id,
             random.randint(10, 20)
         )
@@ -181,12 +208,11 @@ async def on_message(message):
 
 # ================== /PROFILE COMMAND ================== #
 
-@tree.command(name="profile", description="View your rank card")
+@bot.tree.command(name="profile", description="View your rank card")
 async def profile(interaction: discord.Interaction, member: discord.Member = None):
-    member = member or interaction.user
 
-    cursor.execute("SELECT xp, level FROM users WHERE user_id=?", (member.id,))
-    data = cursor.fetchone()
+    member = member or interaction.user
+    data = await get_user_data(member.id)
 
     if not data:
         await interaction.response.send_message("No XP data found.", ephemeral=True)
@@ -200,12 +226,11 @@ async def profile(interaction: discord.Interaction, member: discord.Member = Non
 
 # ================== /LEADERBOARD COMMAND ================== #
 
-@tree.command(name="leaderboard", description="View top XP users")
+@bot.tree.command(name="leaderboard", description="View top XP users")
 async def leaderboard(interaction: discord.Interaction):
+
     card = await create_leaderboard(interaction.guild)
     await interaction.response.send_message(file=discord.File(card, "leaderboard.png"))
-    )
-
 # ---------------- INTERNET QUIZ ---------------- #
 
 @bot.tree.command(name="quiz")
