@@ -1,19 +1,32 @@
-from keep_alive import keep_alive
-keep_alive()
-
-import os
 import discord
 from discord.ext import commands
 from discord import app_commands
+import sqlite3
 import random
 import asyncio
+import os
 import aiohttp
 import html
-import io
-from PIL import Image, ImageDraw, ImageFont
-import databases
+from flask import Flask
+from threading import Thread
+
+# ---------------- KEEP ALIVE (RENDER) ---------------- #
+
+app = Flask('')
+
+@app.route('/')
+def home():
+    return "Bot is alive!"
+
+def run():
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host='0.0.0.0', port=port)
+
+def keep_alive():
+    Thread(target=run).start()
 
 # ---------------- BOT SETUP ---------------- #
+
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
@@ -21,146 +34,265 @@ intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 TOKEN = os.environ.get("TOKEN")
 
-# ---------------- DATABASE SETUP (PostgreSQL) ---------------- #
-DATABASE_URL = os.environ.get("DATABASE_URL")  # Set in Render Environment Variables
-db = databases.Database(DATABASE_URL)
+# ---------------- DATABASE ---------------- #
+
+conn = sqlite3.connect("database.db")
+cursor = conn.cursor()
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS users (
+    user_id INTEGER PRIMARY KEY,
+    xp INTEGER DEFAULT 0,
+    level INTEGER DEFAULT 1
+)
+""")
+conn.commit()
+
+# ---------------- XP SYSTEM ---------------- #
+
 xp_cooldown = {}
 
-async def setup_database():
-    await db.execute("""
-    CREATE TABLE IF NOT EXISTS users (
-        user_id BIGINT PRIMARY KEY,
-        xp INT DEFAULT 0,
-        level INT DEFAULT 1
-    )
-    """)
-
-# ---------------- XP LOGIC ---------------- #
 def xp_required(level):
     return int(100 * (level ** 1.5))
 
-async def add_xp(user_id, amount):
-    query = "SELECT xp, level FROM users WHERE user_id = :user_id"
-    data = await db.fetch_one(query, values={"user_id": user_id})
+def add_xp(user_id, amount):
+    cursor.execute("SELECT xp, level FROM users WHERE user_id=?", (user_id,))
+    data = cursor.fetchone()
 
     if not data:
-        xp = 0
-        level = 1
-        await db.execute(
-            "INSERT INTO users(user_id, xp, level) VALUES(:user_id, :xp, :level)",
-            values={"user_id": user_id, "xp": xp, "level": level}
-        )
+        xp, level = 0, 1
+        cursor.execute("INSERT INTO users VALUES (?, ?, ?)", (user_id, xp, level))
     else:
-        xp = data["xp"]
-        level = data["level"]
+        xp, level = data
 
     xp += amount
     leveled_up = False
+
     while xp >= xp_required(level):
         xp -= xp_required(level)
         level += 1
         leveled_up = True
 
-    await db.execute(
-        "UPDATE users SET xp=:xp, level=:level WHERE user_id=:user_id",
-        values={"xp": xp, "level": level, "user_id": user_id}
-    )
+    cursor.execute("UPDATE users SET xp=?, level=? WHERE user_id=?", (xp, level, user_id))
+    conn.commit()
 
-    return leveled_up, level, xp
+    return level if leveled_up else None
 
-async def get_user_data(user_id):
-    query = "SELECT xp, level FROM users WHERE user_id = :user_id"
-    return await db.fetch_one(query, values={"user_id": user_id})
-
-# ---------------- RANK CARD ---------------- #
-async def create_rank_card(member, xp, level):
-    width, height = 900, 300
-    bg = Image.new("RGB", (width, height), (15, 15, 25))
-    draw = ImageDraw.Draw(bg)
-
-    async with aiohttp.ClientSession() as session:
-        async with session.get(member.display_avatar.url) as resp:
-            avatar_bytes = await resp.read()
-
-    avatar = Image.open(io.BytesIO(avatar_bytes)).convert("RGBA").resize((200, 200))
-    mask = Image.new("L", avatar.size, 0)
-    ImageDraw.Draw(mask).ellipse((0, 0, 200, 200), fill=255)
-    bg.paste(avatar, (50, 50), mask)
-
-    font_big = ImageFont.load_default()
-    font_small = ImageFont.load_default()
-
-    draw.text((300, 60), member.name, fill=(255, 255, 255), font=font_big)
-    draw.text((300, 100), f"Level: {level}", fill=(180, 180, 255), font=font_small)
-
-    xp_needed = xp_required(level)
-    bar_width = 500
-    filled = int((xp / xp_needed) * bar_width)
-
-    draw.rectangle((300, 150, 300 + bar_width, 190), fill=(40, 40, 60))
-    draw.rectangle((300, 150, 300 + filled, 190), fill=(100, 100, 255))
-    draw.text((300, 200), f"{xp}/{xp_needed} XP", fill=(200, 200, 200), font=font_small)
-
-    buffer = io.BytesIO()
-    bg.save(buffer, format="PNG")
-    buffer.seek(0)
-    return buffer
-
-# ---------------- LEADERBOARD ---------------- #
-async def create_leaderboard(guild):
-    width, height = 900, 600
-    bg = Image.new("RGB", (width, height), (20, 20, 30))
-    draw = ImageDraw.Draw(bg)
-    font = ImageFont.load_default()
-
-    query = "SELECT user_id, level, xp FROM users ORDER BY level DESC, xp DESC LIMIT 10"
-    top_users = await db.fetch_all(query)
-
-    draw.text((350, 20), "SERVER LEADERBOARD", fill=(255, 255, 255), font=font)
-
-    y = 80
-    position = 1
-
-    for user in top_users:
-        user_id, level, xp = user["user_id"], user["level"], user["xp"]
-        member = guild.get_member(user_id)
-        if not member:
-            continue
-        draw.text((100, y), f"#{position}  {member.name}  |  Level {level}  ({xp} XP)", fill=(200, 200, 255), font=font)
-        y += 45
-        position += 1
-
-    buffer = io.BytesIO()
-    bg.save(buffer, format="PNG")
-    buffer.seek(0)
-    return buffer
-
-# ---------------- XP ON MESSAGE ---------------- #
 @bot.event
 async def on_message(message):
     if message.author.bot:
         return
 
     now = asyncio.get_event_loop().time()
+
     if message.author.id not in xp_cooldown or now - xp_cooldown[message.author.id] > 30:
         xp_cooldown[message.author.id] = now
-        leveled_up, level, xp = await add_xp(message.author.id, random.randint(10, 20))
-        if leveled_up:
-            card = await create_rank_card(message.author, xp, level)
-            await message.channel.send(content=f"🎉 {message.author.mention} leveled up!", file=discord.File(card, "levelup.png"))
+        level = add_xp(message.author.id, random.randint(10, 20))
+
+        if level:
+            await message.channel.send(
+                f"🎉 {message.author.mention} has reached level {level}. GG! 🔥"
+            )
 
     await bot.process_commands(message)
 
-# ---------------- KEEP ALL OTHER COMMANDS ---------------- #
-# (Paste all your /profile, /leaderboard, /quiz, giveaway, bomb, infection, accuse commands exactly as before)
-# Nothing changes here, PostgreSQL handles XP persistence automatically
+# ---------------- LEADERBOARD ---------------- #
 
-# ---------------- RUN BOT ---------------- #
-async def main():
-    await db.connect()        # Connect to PostgreSQL
-    await setup_database()    # Setup tables if missing
-    async with bot:
-        await bot.start(TOKEN)
-    await db.disconnect()     # Disconnect safely
+@bot.tree.command(name="leaderboard")
+async def leaderboard(interaction: discord.Interaction):
 
-asyncio.run(main())
+    cursor.execute("SELECT user_id, level, xp FROM users ORDER BY level DESC, xp DESC LIMIT 10")
+    top = cursor.fetchall()
+
+    embed = discord.Embed(title="🏆 Level Leaderboard", color=discord.Color.gold())
+
+    for i, (user_id, level, xp) in enumerate(top, start=1):
+        user = await bot.fetch_user(user_id)
+        embed.add_field(
+            name=f"#{i} {user.name}",
+            value=f"Level {level} | XP: {xp}",
+            inline=False
+        )
+
+    await interaction.response.send_message(embed=embed)
+
+# ---------------- PROFILE ---------------- #
+
+@bot.tree.command(name="profile")
+async def profile(interaction: discord.Interaction):
+    cursor.execute("SELECT xp, level FROM users WHERE user_id=?", (interaction.user.id,))
+    data = cursor.fetchone()
+
+    if not data:
+        await interaction.response.send_message("No data yet.")
+        return
+
+    xp, level = data
+    await interaction.response.send_message(
+        f"📊 Level: {level}\nXP: {xp}/{xp_required(level)}"
+    )
+
+# ---------------- INTERNET QUIZ ---------------- #
+
+@bot.tree.command(name="quiz")
+async def quiz(interaction: discord.Interaction):
+
+    await interaction.response.defer()
+
+    async with aiohttp.ClientSession() as session:
+        async with session.get("https://opentdb.com/api.php?amount=1&type=multiple") as resp:
+            data = await resp.json()
+
+    q = data["results"][0]
+
+    question = html.unescape(q["question"])
+    correct = html.unescape(q["correct_answer"])
+    incorrect = [html.unescape(i) for i in q["incorrect_answers"]]
+
+    options = incorrect + [correct]
+    random.shuffle(options)
+
+    class QuizView(discord.ui.View):
+        def __init__(self):
+            super().__init__(timeout=15)
+
+        async def interaction_check(self, i):
+            return i.user == interaction.user
+
+    view = QuizView()
+
+    for option in options:
+        async def callback(i, opt=option):
+            if opt == correct:
+                add_xp(i.user.id, 100)
+                await i.response.edit_message(content="✅ Correct! +100 XP", view=None)
+            else:
+                await i.response.edit_message(content=f"❌ Wrong! Answer: {correct}", view=None)
+
+        button = discord.ui.Button(label=option, style=discord.ButtonStyle.primary)
+        button.callback = callback
+        view.add_item(button)
+
+    await interaction.followup.send(f"🤯 **{question}**", view=view)
+
+# ---------------- GIVEAWAY ---------------- #
+
+class GiveawayView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        self.entries = set()
+
+    @discord.ui.button(label="🎉 Join Giveaway", style=discord.ButtonStyle.green)
+    async def join(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.entries.add(interaction.user.id)
+        await interaction.response.send_message("You joined!", ephemeral=True)
+
+@bot.tree.command(name="giveaway")
+@app_commands.describe(prize="Prize", minutes="Duration in minutes", winners="Number of winners")
+async def giveaway(interaction: discord.Interaction, prize: str, minutes: int, winners: int):
+
+    view = GiveawayView()
+    end_time = asyncio.get_event_loop().time() + minutes * 60
+
+    embed = discord.Embed(
+        title="🎁 Giveaway",
+        description=f"Prize: {prize}\nEnds in: {minutes}m",
+        color=discord.Color.blurple()
+    )
+
+    msg = await interaction.channel.send(embed=embed, view=view)
+    await interaction.response.send_message("Giveaway started!", ephemeral=True)
+
+    while True:
+        remaining = int(end_time - asyncio.get_event_loop().time())
+        if remaining <= 0:
+            break
+
+        embed.description = f"Prize: {prize}\nEnds in: {remaining // 60}m {remaining % 60}s\nEntries: {len(view.entries)}"
+        await msg.edit(embed=embed)
+        await asyncio.sleep(30)
+
+    view.stop()
+    await msg.edit(view=None)
+
+    if view.entries:
+        winners_list = random.sample(list(view.entries), min(winners, len(view.entries)))
+        mentions = " ".join(f"<@{w}>" for w in winners_list)
+        await interaction.channel.send(f"🏆 Winner(s): {mentions}")
+    else:
+        await interaction.channel.send("No participants.")
+
+# ---------------- BOMB GAME ---------------- #
+
+active_bomb = {}
+
+@bot.tree.command(name="bomb_start")
+async def bomb_start(interaction: discord.Interaction):
+
+    if interaction.guild.id in active_bomb:
+        await interaction.response.send_message("Game already running.")
+        return
+
+    holder = interaction.user
+    active_bomb[interaction.guild.id] = holder.id
+
+    await interaction.response.send_message(f"💣 {holder.mention} has the bomb!")
+
+    await asyncio.sleep(30)
+
+    if interaction.guild.id in active_bomb:
+        loser_id = active_bomb.pop(interaction.guild.id)
+        await interaction.channel.send(f"💥 <@{loser_id}> exploded!")
+
+@bot.tree.command(name="bomb_pass")
+async def bomb_pass(interaction: discord.Interaction, member: discord.Member):
+
+    if interaction.guild.id not in active_bomb:
+        await interaction.response.send_message("No active game.")
+        return
+
+    if active_bomb[interaction.guild.id] != interaction.user.id:
+        await interaction.response.send_message("You don't have the bomb!", ephemeral=True)
+        return
+
+    active_bomb[interaction.guild.id] = member.id
+    await interaction.response.send_message(f"💣 Bomb passed to {member.mention}")
+
+# ---------------- INFECTION ---------------- #
+
+infected = {}
+
+@bot.tree.command(name="infection_start")
+async def infection_start(interaction: discord.Interaction):
+
+    infected[interaction.guild.id] = {interaction.user.id}
+    await interaction.response.send_message(
+        f"🧟 Infection started! {interaction.user.mention} is infected!"
+    )
+
+# ---------------- COURT ---------------- #
+
+@bot.tree.command(name="accuse")
+async def accuse(interaction: discord.Interaction, member: discord.Member, reason: str):
+
+    embed = discord.Embed(
+        title="⚖ Court Case",
+        description=f"{member.mention} is accused of {reason}!\n\nReact 👍 Innocent | 👎 Guilty",
+        color=discord.Color.red()
+    )
+
+    msg = await interaction.channel.send(embed=embed)
+    await msg.add_reaction("👍")
+    await msg.add_reaction("👎")
+
+    await interaction.response.send_message("Case started!", ephemeral=True)
+
+# ---------------- READY ---------------- #
+
+@bot.event
+async def on_ready():
+    await bot.tree.sync()
+    print(f"Logged in as {bot.user}")
+
+keep_alive()
+bot.run(TOKEN)
