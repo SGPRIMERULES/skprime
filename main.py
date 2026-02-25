@@ -1,6 +1,3 @@
-from keep_alive import keep_alive
-keep_alive()
-
 import discord
 from discord.ext import commands
 from discord import app_commands
@@ -12,8 +9,6 @@ import aiohttp
 import html
 from flask import Flask
 from threading import Thread
-from PIL import Image, ImageDraw, ImageFont
-import io
 
 # ---------------- KEEP ALIVE (RENDER) ---------------- #
 
@@ -55,6 +50,8 @@ conn.commit()
 
 # ---------------- XP SYSTEM ---------------- #
 
+xp_cooldown = {}
+
 def xp_required(level):
     return int(100 * (level ** 1.5))
 
@@ -64,18 +61,76 @@ def add_xp(user_id, amount):
 
     if not data:
         xp, level = 0, 1
-        cursor.execute("INSERT INTO users (user_id, xp, level) VALUES (?, ?, ?)", (user_id, xp, level))
+        cursor.execute("INSERT INTO users VALUES (?, ?, ?)", (user_id, xp, level))
     else:
         xp, level = data
 
     xp += amount
+    leveled_up = False
 
     while xp >= xp_required(level):
         xp -= xp_required(level)
         level += 1
+        leveled_up = True
 
     cursor.execute("UPDATE users SET xp=?, level=? WHERE user_id=?", (xp, level, user_id))
     conn.commit()
+
+    return level if leveled_up else None
+
+@bot.event
+async def on_message(message):
+    if message.author.bot:
+        return
+
+    now = asyncio.get_event_loop().time()
+
+    if message.author.id not in xp_cooldown or now - xp_cooldown[message.author.id] > 30:
+        xp_cooldown[message.author.id] = now
+        level = add_xp(message.author.id, random.randint(10, 20))
+
+        if level:
+            await message.channel.send(
+                f"🎉 {message.author.mention} has reached level {level}. GG! 🔥"
+            )
+
+    await bot.process_commands(message)
+
+# ---------------- LEADERBOARD ---------------- #
+
+@bot.tree.command(name="leaderboard")
+async def leaderboard(interaction: discord.Interaction):
+
+    cursor.execute("SELECT user_id, level, xp FROM users ORDER BY level DESC, xp DESC LIMIT 10")
+    top = cursor.fetchall()
+
+    embed = discord.Embed(title="🏆 Level Leaderboard", color=discord.Color.gold())
+
+    for i, (user_id, level, xp) in enumerate(top, start=1):
+        user = await bot.fetch_user(user_id)
+        embed.add_field(
+            name=f"#{i} {user.name}",
+            value=f"Level {level} | XP: {xp}",
+            inline=False
+        )
+
+    await interaction.response.send_message(embed=embed)
+
+# ---------------- PROFILE ---------------- #
+
+@bot.tree.command(name="profile")
+async def profile(interaction: discord.Interaction):
+    cursor.execute("SELECT xp, level FROM users WHERE user_id=?", (interaction.user.id,))
+    data = cursor.fetchone()
+
+    if not data:
+        await interaction.response.send_message("No data yet.")
+        return
+
+    xp, level = data
+    await interaction.response.send_message(
+        f"📊 Level: {level}\nXP: {xp}/{xp_required(level)}"
+    )
 
 # ---------------- INTERNET QUIZ ---------------- #
 
@@ -205,24 +260,19 @@ async def bomb_pass(interaction: discord.Interaction, member: discord.Member):
 
 # ---------------- INFECTION ---------------- #
 
-infected = {}
-
 @bot.event
 async def on_message(message):
     if message.author.bot:
         return
 
-    if message.guild is None:
-        return
-
     guild_id = message.guild.id
 
     if guild_id in infected:
-        if any(u.id in infected[guild_id] for u in message.mentions):
+        # Check if the message mentions someone infected
+        if any(user_id in [u.id for u in message.mentions] for user_id in infected[guild_id]):
             infected[guild_id].add(message.author.id)
             await message.channel.send(f"🧟 {message.author.mention} is infected!")
-
-    await bot.process_commands(message)
+    )
 
 # ---------------- COURT ---------------- #
 
@@ -231,23 +281,24 @@ async def accuse(interaction: discord.Interaction, member: discord.Member, reaso
 
     embed = discord.Embed(
         title="⚖ Court Case",
-        description=f"{member.mention} is accused of {reason}!\n\nReact 👍 Criminal | 👎 Innocent",
+        description=f"{member.mention} is accused of {reason}!\n\nReact 👍 Innocent | 👎 Guilty",
         color=discord.Color.red()
     )
 
-    await interaction.response.send_message(embed=embed)
-
-    msg = await interaction.original_response()
+    msg = await interaction.channel.send(embed=embed)
     await msg.add_reaction("👍")
     await msg.add_reaction("👎")
+
+    await interaction.response.send_message("Case started!", ephemeral=True)
 
 # ---------------- READY ---------------- #
 
 @bot.event
 async def on_ready():
+    # Only sync once
     try:
         await bot.tree.sync()
-        print("Commands synced!")
+        print(f"Commands synced!")
     except Exception as e:
         print(e)
 
