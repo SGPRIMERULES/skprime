@@ -1,3 +1,6 @@
+from keep_alive
+import keep_alive keep_alive()
+
 import discord
 from discord.ext import commands
 from discord import app_commands
@@ -9,7 +12,8 @@ import aiohttp
 import html
 from flask import Flask
 from threading import Thread
-
+from PIL import Image, ImageDraw, ImageFont
+import io
 # ---------------- KEEP ALIVE (RENDER) ---------------- #
 
 app = Flask('')
@@ -76,25 +80,51 @@ def add_xp(user_id, amount):
     cursor.execute("UPDATE users SET xp=?, level=? WHERE user_id=?", (xp, level, user_id))
     conn.commit()
 
-    return level if leveled_up else None
+    return level if leveled_up else None, xp, level
 
-@bot.event
-async def on_message(message):
-    if message.author.bot:
-        return
+async def generate_xp_card(user: discord.User, xp: int, level: int):
+    # Create an image
+    width, height = 400, 150
+    card = Image.new("RGB", (width, height), color=(30, 30, 30))
+    draw = ImageDraw.Draw(card)
 
-    now = asyncio.get_event_loop().time()
+    # Fonts (you can download a .ttf font file and put the path here)
+    font_large = ImageFont.truetype("arial.ttf", 30)
+    font_small = ImageFont.truetype("arial.ttf", 20)
 
-    if message.author.id not in xp_cooldown or now - xp_cooldown[message.author.id] > 30:
-        xp_cooldown[message.author.id] = now
-        level = add_xp(message.author.id, random.randint(10, 20))
+    # Background rectangle
+    draw.rectangle([(0,0),(width,height)], fill=(40,40,40))
 
-        if level:
-            await message.channel.send(
-                f"🎉 {message.author.mention} has reached level {level}. GG! 🔥"
-            )
+    # Draw user name
+    draw.text((150, 20), user.name, font=font_large, fill=(255, 255, 255))
 
-    await bot.process_commands(message)
+    # Draw level
+    draw.text((150, 60), f"Level: {level}", font=font_small, fill=(255, 215, 0))
+
+    # Draw XP bar
+    bar_x, bar_y = 150, 100
+    bar_width, bar_height = 200, 20
+    progress = xp / xp_required(level)
+    draw.rectangle([bar_x, bar_y, bar_x+bar_width, bar_y+bar_height], fill=(100,100,100))
+    draw.rectangle([bar_x, bar_y, bar_x+int(bar_width*progress), bar_y+bar_height], fill=(255,215,0))
+
+    # Draw XP text
+    draw.text((bar_x, bar_y-25), f"XP: {xp}/{xp_required(level)}", font=font_small, fill=(255,255,255))
+
+    # Optional: user avatar
+    asset = user.display_avatar.with_size(64)
+    buffer = io.BytesIO()
+    await asset.save(buffer, format="PNG")
+    buffer.seek(0)
+    avatar = Image.open(buffer).convert("RGBA")
+    avatar = avatar.resize((100, 100))
+    card.paste(avatar, (20, 25), avatar)
+
+    # Save to bytes
+    buffer_out = io.BytesIO()
+    card.save(buffer_out, format="PNG")
+    buffer_out.seek(0)
+    return buffer_out
 
 # ---------------- LEADERBOARD ---------------- #
 
@@ -128,9 +158,8 @@ async def profile(interaction: discord.Interaction):
         return
 
     xp, level = data
-    await interaction.response.send_message(
-        f"📊 Level: {level}\nXP: {xp}/{xp_required(level)}"
-    )
+    card_image = await generate_xp_card(interaction.user, xp, level)
+    await interaction.response.send_message(file=discord.File(card_image, filename="profile.png"))
 
 # ---------------- INTERNET QUIZ ---------------- #
 
