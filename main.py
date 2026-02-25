@@ -293,8 +293,12 @@ async def accuse(interaction: discord.Interaction, member: discord.Member, reaso
 
 @bot.event
 async def on_ready():
-    await bot.tree.sync()
-    print(f"Logged in as {bot.user}")
+    # Only sync once
+    try:
+        await bot.tree.sync()
+        print(f"Commands synced!")
+    except Exception as e:
+        print(e)
 
 keep_alive()
 bot.run(TOKEN)
