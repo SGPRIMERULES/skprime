@@ -260,14 +260,17 @@ async def bomb_pass(interaction: discord.Interaction, member: discord.Member):
 
 # ---------------- INFECTION ---------------- #
 
-infected = {}
+@bot.event
+async def on_message(message):
+    if message.author.bot:
+        return
 
-@bot.tree.command(name="infection_start")
-async def infection_start(interaction: discord.Interaction):
-
-    infected[interaction.guild.id] = {interaction.user.id}
-    await interaction.response.send_message(
-        f"🧟 Infection started! {interaction.user.mention} is infected!"
+    guild_id = message.guild.id
+    if guild_id in infected:
+        # Check if the message mentions someone infected
+        if any(user_id in [u.id for u in message.mentions] for user_id in infected[guild_id]):
+            infected[guild_id].add(message.author.id)
+            await message.channel.send(f"🧟 {message.author.mention} just got infected!")mention} is infected!"
     )
 
 # ---------------- COURT ---------------- #
