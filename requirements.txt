@@ -2,3 +2,5 @@ discord.py
 flask
 aiohttp
 aiosqlite
+databases[postgresql]
+asyncpg
