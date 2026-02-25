@@ -1,5 +1,4 @@
 from keep_alive import keep_alive
-
 keep_alive()
 
 import discord
@@ -15,6 +14,7 @@ from flask import Flask
 from threading import Thread
 from PIL import Image, ImageDraw, ImageFont
 import io
+
 # ---------------- KEEP ALIVE (RENDER) ---------------- #
 
 app = Flask('')
@@ -52,6 +52,30 @@ CREATE TABLE IF NOT EXISTS users (
 )
 """)
 conn.commit()
+
+# ---------------- XP SYSTEM ---------------- #
+
+def xp_required(level):
+    return int(100 * (level ** 1.5))
+
+def add_xp(user_id, amount):
+    cursor.execute("SELECT xp, level FROM users WHERE user_id=?", (user_id,))
+    data = cursor.fetchone()
+
+    if not data:
+        xp, level = 0, 1
+        cursor.execute("INSERT INTO users (user_id, xp, level) VALUES (?, ?, ?)", (user_id, xp, level))
+    else:
+        xp, level = data
+
+    xp += amount
+
+    while xp >= xp_required(level):
+        xp -= xp_required(level)
+        level += 1
+
+    cursor.execute("UPDATE users SET xp=?, level=? WHERE user_id=?", (xp, level, user_id))
+    conn.commit()
 
 # ---------------- INTERNET QUIZ ---------------- #
 
@@ -181,18 +205,24 @@ async def bomb_pass(interaction: discord.Interaction, member: discord.Member):
 
 # ---------------- INFECTION ---------------- #
 
+infected = {}
+
 @bot.event
 async def on_message(message):
     if message.author.bot:
         return
 
+    if message.guild is None:
+        return
+
     guild_id = message.guild.id
 
     if guild_id in infected:
-        # Check if the message mentions someone infected
-        if any(user_id in [u.id for u in message.mentions] for user_id in infected[guild_id]):
+        if any(u.id in infected[guild_id] for u in message.mentions):
             infected[guild_id].add(message.author.id)
             await message.channel.send(f"🧟 {message.author.mention} is infected!")
+
+    await bot.process_commands(message)
 
 # ---------------- COURT ---------------- #
 
@@ -205,10 +235,8 @@ async def accuse(interaction: discord.Interaction, member: discord.Member, reaso
         color=discord.Color.red()
     )
 
-    # Send embed as interaction response
     await interaction.response.send_message(embed=embed)
 
-    # Fetch the message object just sent
     msg = await interaction.original_response()
     await msg.add_reaction("👍")
     await msg.add_reaction("👎")
@@ -217,10 +245,9 @@ async def accuse(interaction: discord.Interaction, member: discord.Member, reaso
 
 @bot.event
 async def on_ready():
-    # Only sync once
     try:
         await bot.tree.sync()
-        print(f"Commands synced!")
+        print("Commands synced!")
     except Exception as e:
         print(e)
 
