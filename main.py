@@ -8,6 +8,7 @@ import sqlite3
 import random
 import asyncio
 import os
+from PIL import Image, ImageDraw, ImageFont
 import aiohttp
 import html
 from flask import Flask
@@ -36,7 +37,13 @@ CREATE TABLE IF NOT EXISTS users (
 """)
 conn.commit()
 
-# ---------------- XP SYSTEM ---------------- #
+# ================== XP SYSTEM ================== #
+
+import random
+import asyncio
+from PIL import Image, ImageDraw, ImageFont
+import aiohttp
+import io
 
 xp_cooldown = {}
 
@@ -64,7 +71,88 @@ def add_xp(user_id, amount):
     cursor.execute("UPDATE users SET xp=?, level=? WHERE user_id=?", (xp, level, user_id))
     conn.commit()
 
-    return level if leveled_up else None
+    return leveled_up, level, xp
+
+
+# ================== RANK CARD IMAGE ================== #
+
+async def create_rank_card(member, xp, level):
+    width, height = 900, 300
+    bg = Image.new("RGB", (width, height), (15, 15, 25))
+    draw = ImageDraw.Draw(bg)
+
+    # Fetch avatar
+    async with aiohttp.ClientSession() as session:
+        async with session.get(member.display_avatar.url) as resp:
+            avatar_bytes = await resp.read()
+
+    avatar = Image.open(io.BytesIO(avatar_bytes)).convert("RGBA")
+    avatar = avatar.resize((200, 200))
+
+    mask = Image.new("L", avatar.size, 0)
+    ImageDraw.Draw(mask).ellipse((0, 0, 200, 200), fill=255)
+    bg.paste(avatar, (50, 50), mask)
+
+    font_big = ImageFont.load_default()
+    font_small = ImageFont.load_default()
+
+    draw.text((300, 60), member.name, fill=(255, 255, 255), font=font_big)
+    draw.text((300, 100), f"Level: {level}", fill=(180, 180, 255), font=font_small)
+
+    xp_needed = xp_required(level)
+    bar_width = 500
+    filled = int((xp / xp_needed) * bar_width)
+
+    draw.rectangle((300, 150, 300 + bar_width, 190), fill=(40, 40, 60))
+    draw.rectangle((300, 150, 300 + filled, 190), fill=(100, 100, 255))
+
+    draw.text((300, 200), f"{xp}/{xp_needed} XP", fill=(200, 200, 200), font=font_small)
+
+    buffer = io.BytesIO()
+    bg.save(buffer, format="PNG")
+    buffer.seek(0)
+    return buffer
+
+
+# ================== LEADERBOARD IMAGE ================== #
+
+async def create_leaderboard(guild):
+    width, height = 900, 600
+    bg = Image.new("RGB", (width, height), (20, 20, 30))
+    draw = ImageDraw.Draw(bg)
+    font = ImageFont.load_default()
+
+    cursor.execute(
+        "SELECT user_id, level, xp FROM users ORDER BY level DESC, xp DESC LIMIT 10"
+    )
+    top_users = cursor.fetchall()
+
+    draw.text((350, 20), "SERVER LEADERBOARD", fill=(255, 255, 255), font=font)
+
+    y = 80
+    position = 1
+
+    for user_id, level, xp in top_users:
+        member = guild.get_member(user_id)
+        if not member:
+            continue
+
+        draw.text(
+            (100, y),
+            f"#{position}  {member.name}  |  Level {level}  ({xp} XP)",
+            fill=(200, 200, 255),
+            font=font
+        )
+        y += 45
+        position += 1
+
+    buffer = io.BytesIO()
+    bg.save(buffer, format="PNG")
+    buffer.seek(0)
+    return buffer
+
+
+# ================== XP MESSAGE EVENT ================== #
 
 @bot.event
 async def on_message(message):
@@ -75,49 +163,47 @@ async def on_message(message):
 
     if message.author.id not in xp_cooldown or now - xp_cooldown[message.author.id] > 30:
         xp_cooldown[message.author.id] = now
-        level = add_xp(message.author.id, random.randint(10, 20))
 
-        if level:
+        leveled_up, level, xp = add_xp(
+            message.author.id,
+            random.randint(10, 20)
+        )
+
+        if leveled_up:
+            card = await create_rank_card(message.author, xp, level)
             await message.channel.send(
-                f"🎉 {message.author.mention} has reached level {level}. GG! 🔥"
+                content=f"🎉 {message.author.mention} leveled up!",
+                file=discord.File(card, "levelup.png")
             )
 
     await bot.process_commands(message)
 
-# ---------------- LEADERBOARD ---------------- #
 
-@bot.tree.command(name="leaderboard")
-async def leaderboard(interaction: discord.Interaction):
+# ================== /PROFILE COMMAND ================== #
 
-    cursor.execute("SELECT user_id, level, xp FROM users ORDER BY level DESC, xp DESC LIMIT 10")
-    top = cursor.fetchall()
+@tree.command(name="profile", description="View your rank card")
+async def profile(interaction: discord.Interaction, member: discord.Member = None):
+    member = member or interaction.user
 
-    embed = discord.Embed(title="🏆 Level Leaderboard", color=discord.Color.gold())
-
-    for i, (user_id, level, xp) in enumerate(top, start=1):
-        user = await bot.fetch_user(user_id)
-        embed.add_field(
-            name=f"#{i} {user.name}",
-            value=f"Level {level} | XP: {xp}",
-            inline=False
-        )
-
-    await interaction.response.send_message(embed=embed)
-
-# ---------------- PROFILE ---------------- #
-
-@bot.tree.command(name="profile")
-async def profile(interaction: discord.Interaction):
-    cursor.execute("SELECT xp, level FROM users WHERE user_id=?", (interaction.user.id,))
+    cursor.execute("SELECT xp, level FROM users WHERE user_id=?", (member.id,))
     data = cursor.fetchone()
 
     if not data:
-        await interaction.response.send_message("No data yet.")
+        await interaction.response.send_message("No XP data found.", ephemeral=True)
         return
 
     xp, level = data
-    await interaction.response.send_message(
-        f"📊 Level: {level}\nXP: {xp}/{xp_required(level)}"
+    card = await create_rank_card(member, xp, level)
+
+    await interaction.response.send_message(file=discord.File(card, "rank.png"))
+
+
+# ================== /LEADERBOARD COMMAND ================== #
+
+@tree.command(name="leaderboard", description="View top XP users")
+async def leaderboard(interaction: discord.Interaction):
+    card = await create_leaderboard(interaction.guild)
+    await interaction.response.send_message(file=discord.File(card, "leaderboard.png"))
     )
 
 # ---------------- INTERNET QUIZ ---------------- #
