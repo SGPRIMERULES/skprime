@@ -277,15 +277,17 @@ async def accuse(interaction: discord.Interaction, member: discord.Member, reaso
 
     embed = discord.Embed(
         title="⚖ Court Case",
-        description=f"{member.mention} is accused of {reason}!\n\nReact 👍 Innocent | 👎 Guilty",
+        description=f"{member.mention} is accused of {reason}!\n\nReact 👍 Criminal | 👎 Innocent",
         color=discord.Color.red()
     )
 
-    msg = await interaction.channel.send(embed=embed)
+    # Send embed as interaction response
+    await interaction.response.send_message(embed=embed)
+
+    # Fetch the message object just sent
+    msg = await interaction.original_response()
     await msg.add_reaction("👍")
     await msg.add_reaction("👎")
-
-    await interaction.response.send_message("Case started!", ephemeral=True)
 
 # ---------------- READY ---------------- #
 
